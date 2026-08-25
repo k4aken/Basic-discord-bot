@@ -190,7 +190,7 @@ async def set_config(guild_id: int, column: str, value):
     }
 
     if column not in allowed:
-        raise ValueError("Invalid configuration field.")
+        raise ValueError("Invalid field.")
 
     await bot.db.execute(
         f"""
