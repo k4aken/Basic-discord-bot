@@ -2,6 +2,7 @@ import os
 import re
 import time
 import asyncio
+import aiohttp
 import logging
 from collections import defaultdict, deque
 from datetime import timedelta, datetime, timezone
@@ -12,6 +13,9 @@ from discord.ext import commands, tasks
 import aiosqlite
 
 TOKEN = os.getenv("TOKEN")
+profanity = os.getenv("profanity")
+profanityURL = "https://api.api-ninjas.com/v1/profanityfilter"
+
 
 DATABASE = "bot.db"
 
@@ -23,11 +27,6 @@ CAPS_PERCENT = 0.75
 CAPS_MINIMUM_LENGTH = 12
 
 DEFAULT_WARN_LIMIT = 3
-
-BAD_WORDS = {
-    "badword1",
-    "badword2",
-}
 
 URL_REGEX = re.compile(
     r"(https?://|www\.)[^\s]+",
@@ -59,6 +58,12 @@ class PrivateModerationBot(commands.Bot):
         )
 
         self.db = None
+        self.http = None
+        self.profanity_cache = {}
+        self.profanity_cache_ttl = 300
+        self.config_cache = {}
+        self.word_cache = {}
+
 
         self.spam_tracker = defaultdict(deque)
 
@@ -73,6 +78,9 @@ class PrivateModerationBot(commands.Bot):
     async def setup_hook(self):
 
         self.db = await aiosqlite.connect(DATABASE)
+        self.http = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=3)
+        )
 
         await self.db.executescript("""
         CREATE TABLE IF NOT EXISTS guild_config (
@@ -127,6 +135,9 @@ class PrivateModerationBot(commands.Bot):
         logger.info("Slash commands synced.")
 
     async def close(self):
+        if self.http:
+            await self.http.close()
+
         if self.db:
             await self.db.close()
 
@@ -1192,6 +1203,81 @@ async def automod_action(
         discord.Color.red()
     )
 
+async def check_profanity(text: str):
+    if not PROFANITY_API_KEY or not text.strip():
+        return False
+
+    key = text.strip().lower()
+
+    cached = bot.profanity_cache.get(key)
+    if cached:
+        result, expires_at = cached
+        if time.monotonic() < expires_at:
+            return result
+        bot.profanity_cache.pop(key, None)
+
+    try:
+        async with bot.http.get(
+            PROFANITY_API_URL,
+            headers={"X-Api-Key": PROFANITY_API_KEY},
+            params={"text": text[:1000]}
+        ) as response:
+
+            if response.status != 200:
+                logger.warning(
+                    f"Profanity API returned HTTP {response.status}"
+                )
+                return False
+
+            data = await response.json()
+            result = bool(data.get("has_profanity"))
+
+            bot.profanity_cache[key] = (
+                result,
+                time.monotonic() + bot.profanity_cache_ttl
+            )
+
+            return result
+
+    except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+        logger.warning(f"Profanity API request failed: {error}")
+        return False
+
+
+async def get_custom_words(guild_id: int):
+    cached = bot.word_cache.get(guild_id)
+
+    if cached is not None:
+        return cached
+
+    cursor = await bot.db.execute(
+        """
+        SELECT word FROM banned_words
+        WHERE guild_id = ?
+        """,
+        (guild_id,)
+    )
+
+    words = {
+        row[0].lower()
+        for row in await cursor.fetchall()
+        if row[0]
+    }
+
+    bot.word_cache[guild_id] = words
+    return words
+
+
+def contains_custom_word(content: str, words: set[str]):
+    for word in words:
+        pattern = rf"\b{re.escape(word)}\b"
+
+        if re.search(pattern, content, re.IGNORECASE):
+            return word
+
+    return None
+
+
 @bot.event
 async def on_message(message: discord.Message):
 
@@ -1268,33 +1354,32 @@ async def on_message(message: discord.Message):
     if member.guild_permissions.manage_messages:
         return
 
-    content = message.content.lower()
+    content = message.content
 
-    cursor = await bot.db.execute(
-        """
-        SELECT word FROM banned_words
-        WHERE guild_id = ?
-        """,
-        (guild.id,)
+    custom_words = await get_custom_words(guild.id)
+
+    matched_word = contains_custom_word(
+        content,
+        custom_words
     )
 
-    custom_words = {
-        row[0].lower()
-        for row in await cursor.fetchall()
-    }
+    if matched_word:
 
-    all_words = BAD_WORDS | custom_words
+        await automod_action(
+            message,
+            f"Server filtered word: `{matched_word}`"
+        )
 
-    for word in all_words:
+        return
 
-        if word and word in content:
+    if await check_profanity(content):
 
-            await automod_action(
-                message,
-                f"Blocked word: `{word}`"
-            )
+        await automod_action(
+            message,
+            "Profanity detected"
+        )
 
-            return
+        return
 
     if config[3]:
 
@@ -1410,6 +1495,11 @@ async def filter_add(
 
     await bot.db.commit()
 
+    bot.word_cache.setdefault(
+        interaction.guild.id,
+        set()
+    ).add(word)
+
     await interaction.response.send_message(
         f"Added `{word}` to the filter."
     )
@@ -1436,6 +1526,11 @@ async def filter_remove(
     )
 
     await bot.db.commit()
+
+    bot.word_cache.setdefault(
+        interaction.guild.id,
+        set()
+    ).discard(word.lower())
 
     await interaction.response.send_message(
         f"Removed `{word}` from the filter."
